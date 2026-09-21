@@ -1,7 +1,9 @@
 # 依赖图发布回滚 API（FastAPI + SQLite）
 
-本地可运行的服务节点依赖图发布系统：客户端提交服务节点及依赖关系，创建带版本号的发布批次；
-系统按**拓扑层级**生成执行计划，接收每个节点的成功/失败回报；节点失败时**仅回滚本批次已成功的节点**
+本地可运行的服务节点依赖图发布系统：客户端提交服务节点及依赖关系（节点可带正整数预估工期 `estimated_seconds`），
+创建带版本号的发布批次；
+系统按**拓扑层级**生成执行计划，并对依赖 DAG 做**关键路径（CPM）动态规划**给出最短工期、各节点最早/最晚开始时间与零余量关键节点；
+接收每个节点的成功/失败回报；节点失败时**仅回滚本批次已成功的节点**
 并返回**可重试的断点**；同时拒绝**循环依赖**和**跨版本 / 乱序回报**。
 
 ## 一条命令启动
@@ -47,12 +49,26 @@ DB_PATH=./data/releases.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ## 核心语义
 
-**执行计划（拓扑分层）**
+**执行计划（拓扑分层 + 工期分析）**
 
 - 依赖边 `from -> to` 表示 `to` 依赖 `from`，`from` 必须先执行。
 - 系统用 Kahn 算法分层：level 0 无依赖可先执行，level N 的所有前置节点都位于更低层级。
 - 同一 level 内节点互不依赖，可并行回报；跨 level 必须按顺序。
 - 存在环时创建批次返回 `422 cycle_detected`，并给出环上节点。
+- 节点可携带 `estimated_seconds`（**正整数，秒**）作为预估工期；不传按 `0` 处理。
+- `GET /api/releases/{id}/plan` 在拓扑分层之外，基于依赖 DAG 做关键路径（CPM）动态规划：
+  - 前向 DP 得各节点最早开始时间 `earliest_start` 与**最短总工期** `shortest_duration_seconds`
+    （同层节点可并行，总工期 = DAG 上的最长路径长度）；
+  - 后向 DP 得各节点最晚开始时间 `latest_start` 与总时差 `total_slack = latest_start - earliest_start`；
+  - `total_slack = 0` 的节点全部列入 `critical_nodes`，`is_critical` 在逐节点结果中同步标出；
+  - `critical_path` 给出一条最长源-汇路径；并列最长路径存在时，返回**节点名序列字典序最小**的一条。
+- 计划接口支持可选查询参数 `deadline_seconds`（非负整数秒）：
+  - `deadline_seconds >= 最短总工期`：`feasible=true`、`gap_seconds=0`；
+  - `deadline_seconds < 最短总工期`：仍返回**完整**分析（各时间、余量、关键节点/路径照常给出），
+    同时 `feasible=false`、`gap_seconds = 最短总工期 - deadline_seconds`（缺口秒数）；
+  - 该接口为**只读**分析，任何参数都不会改变批次或节点状态。
+- 旧批次（创建时未提供工期 / 升级前的数据）缺省工期一律按 `0` 处理，CPM 仍可输出完整结果；
+  服务启动时会自动为旧版 SQLite 文件补列（`ALTER TABLE` 迁移，幂等）。
 
 **回报与并发控制**
 
@@ -78,10 +94,10 @@ DB_PATH=./data/releases.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `POST` | `/api/releases` | 创建发布批次（提交节点 + 依赖，自动拓扑分层，拒绝环） |
+| `POST` | `/api/releases` | 创建发布批次（提交节点 + 依赖，节点可填正整数 `estimated_seconds`，自动拓扑分层，拒绝环） |
 | `GET` | `/api/releases?limit=50` | 发布批次列表 |
 | `GET` | `/api/releases/{id}` | 查询发布状态（节点状态、进度、next_nodes） |
-| `GET` | `/api/releases/{id}/plan` | 查询拓扑分层执行计划 |
+| `GET` | `/api/releases/{id}/plan?deadline_seconds=` | 拓扑分层 + CPM 工期分析（最短工期、最早/最晚开始、total_slack、零余量关键节点、字典序最小关键路径；可选截止工期可行性，只读） |
 | `POST` | `/api/releases/{id}/report` | 节点成功 / 失败回报（跨版本、乱序返回 409） |
 | `POST` | `/api/releases/{id}/retry` | 从断点续发 |
 | `GET` | `/health` | 健康检查 |
@@ -108,8 +124,39 @@ curl -s -X POST http://localhost:8000/api/releases \
   }'
 # -> 计划分层: level0=[svc-a,svc-b]  level1=[svc-c]  level2=[svc-d]
 
-# 2) 查看执行计划
+# 2) 查看执行计划（含 CPM 关键路径分析）
 curl -s http://localhost:8000/api/releases/<ID>/plan
+#    （上例未填 estimated_seconds，所有工期按 0：最短工期 0、全部节点 total_slack=0）
+
+# 2b) 带工期的批次 + deadline 可行性分析（示例：a=2s, b=5s, c=3s, d=1s）
+curl -s -X POST http://localhost:8000/api/releases \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version": "2026.09.21-002",
+    "nodes": [
+      {"name": "svc-a", "estimated_seconds": 2},
+      {"name": "svc-b", "estimated_seconds": 5},
+      {"name": "svc-c", "estimated_seconds": 3},
+      {"name": "svc-d", "estimated_seconds": 1}
+    ],
+    "dependencies": [
+      {"from_node": "svc-a", "to_node": "svc-c"},
+      {"from_node": "svc-b", "to_node": "svc-c"},
+      {"from_node": "svc-c", "to_node": "svc-d"}
+    ]
+  }'
+# 关键路径 svc-b -> svc-c -> svc-d（5+3+1=9 秒，svc-a 有 3 秒余量）
+curl -s 'http://localhost:8000/api/releases/<ID>/plan?deadline_seconds=8'
+# -> schedule:
+# {
+#   "shortest_duration_seconds": 9,
+#   "deadline_seconds": 8,
+#   "feasible": false,
+#   "gap_seconds": 1,
+#   "critical_nodes": ["svc-b", "svc-c", "svc-d"],
+#   "critical_path": ["svc-b", "svc-c", "svc-d"]
+# }
+# 每个节点附带：estimated_seconds / earliest_start / latest_start / total_slack / is_critical
 
 # 3) 回报 level0 成功（同层可并行/乱序回报）
 curl -s -X POST http://localhost:8000/api/releases/<ID>/report \
@@ -173,4 +220,6 @@ python3 smoke_test.py
 ```
 
 覆盖：循环依赖拒绝、拓扑分层、跨版本回报拒绝、乱序回报拒绝、重复回报拒绝、
-失败逆序回滚本批次已成功节点、断点重试后走完全程、部分回滚、历史批次隔离、重复初始化幂等。
+失败逆序回滚本批次已成功节点、断点重试后走完全程、部分回滚、历史批次隔离、重复初始化幂等、
+CPM 前向/后向分析与零余量关键节点、并列最长路径字典序最小、deadline 可行性与缺口秒数、
+查询不改变批次状态、estimated_seconds 正整数校验、旧版 SQLite 文件自动迁移且旧工期按 0。

@@ -76,7 +76,98 @@ with TestClient(app) as client:
         {"level": 1, "parallel_nodes": ["c"]},
         {"level": 2, "parallel_nodes": ["d"]},
     ]
-    print("[OK] 执行计划接口")
+    # 未填 estimated_seconds：旧批次语义，工期全部按 0
+    s0 = plan["schedule"]
+    assert s0["shortest_duration_seconds"] == 0
+    assert s0["deadline_seconds"] is None and s0["feasible"] is True
+    assert s0["gap_seconds"] is None
+    assert s0["critical_nodes"] == ["a", "b", "c", "d"]
+    assert s0["critical_path"] == ["a", "c", "d"]  # 多条零长路径中字典序最小
+    assert all(n["estimated_seconds"] == 0 and n["total_slack"] == 0 for n in plan["nodes"])
+    print("[OK] 执行计划接口（缺省工期按 0，CPM 零工期分析）")
+
+    # --- 4b. 带工期的 CPM 分析：前向 / 后向 DP、零余量关键节点 ---
+    r = client.post("/api/releases", json={
+        "version": "v-cpm",
+        "nodes": [
+            {"name": "a", "estimated_seconds": 2},
+            {"name": "b", "estimated_seconds": 5},
+            {"name": "c", "estimated_seconds": 3},
+            {"name": "d", "estimated_seconds": 1},
+        ],
+        "dependencies": [
+            {"from_node": "a", "to_node": "c"},
+            {"from_node": "b", "to_node": "c"},
+            {"from_node": "c", "to_node": "d"},
+            {"from_node": "b", "to_node": "d"},
+        ],
+    })
+    cid = r.json()["id"]
+    cp = client.get(f"/api/releases/{cid}/plan").json()
+    sch = cp["schedule"]
+    tt = {n["name"]: n for n in cp["nodes"]}
+    # 前向：a/b 从 0 开始；c 等 b（ES=5）；d 等 c（ES=8）；最短总工期 9
+    assert tt["a"]["earliest_start"] == 0 and tt["a"]["latest_start"] == 3
+    assert tt["b"]["earliest_start"] == 0 and tt["b"]["latest_start"] == 0
+    assert tt["c"]["earliest_start"] == 5 and tt["c"]["latest_start"] == 5
+    assert tt["d"]["earliest_start"] == 8 and tt["d"]["latest_start"] == 8
+    assert tt["a"]["total_slack"] == 3
+    assert {n for n in ("b", "c", "d") if tt[n]["total_slack"] == 0} == {"b", "c", "d"}
+    assert sch["shortest_duration_seconds"] == 9
+    assert sch["critical_nodes"] == ["b", "c", "d"]
+    assert sch["critical_path"] == ["b", "c", "d"]  # b->d 仅 6 秒，非最长
+    print("[OK] CPM：最短工期", sch["shortest_duration_seconds"],
+          "关键节点", sch["critical_nodes"], "路径", sch["critical_path"])
+
+    # --- 4c. 并列最长路径取节点名序列字典序最小 ---
+    r = client.post("/api/releases", json={
+        "version": "v-tie",
+        "nodes": [
+            {"name": "s", "estimated_seconds": 1},
+            {"name": "m", "estimated_seconds": 2},
+            {"name": "n", "estimated_seconds": 2},
+            {"name": "e", "estimated_seconds": 1},
+        ],
+        "dependencies": [
+            {"from_node": "s", "to_node": "m"},
+            {"from_node": "s", "to_node": "n"},
+            {"from_node": "m", "to_node": "e"},
+            {"from_node": "n", "to_node": "e"},
+        ],
+    })
+    tid = r.json()["id"]
+    tsch = client.get(f"/api/releases/{tid}/plan").json()["schedule"]
+    assert tsch["shortest_duration_seconds"] == 4
+    assert tsch["critical_nodes"] == ["s", "m", "n", "e"]
+    assert tsch["critical_path"] == ["s", "m", "e"], tsch["critical_path"]
+    print("[OK] 并列最长路径 -> 字典序最小:", tsch["critical_path"])
+
+    # --- 4d. deadline_seconds：可行 / 恰好 / 不可行（完整分析 + 缺口）---
+    bad = client.get(f"/api/releases/{tid}/plan?deadline_seconds=3").json()["schedule"]
+    assert bad["feasible"] is False and bad["gap_seconds"] == 1
+    assert bad["deadline_seconds"] == 3
+    assert bad["shortest_duration_seconds"] == 4  # 仍返回完整分析
+    assert bad["critical_path"] == ["s", "m", "e"] and bad["critical_nodes"] == ["s", "m", "n", "e"]
+    exact = client.get(f"/api/releases/{tid}/plan?deadline_seconds=4").json()["schedule"]
+    assert exact["feasible"] is True and exact["gap_seconds"] == 0
+    loose = client.get(f"/api/releases/{tid}/plan?deadline_seconds=10").json()["schedule"]
+    assert loose["feasible"] is True and loose["gap_seconds"] == 0
+    # 查询不得改变批次状态
+    assert client.get(f"/api/releases/{tid}").json()["status"] == "pending"
+    # deadline 非非负整数 -> 422（请求校验，不进入业务逻辑）
+    assert client.get(f"/api/releases/{tid}/plan?deadline_seconds=-1").status_code == 422
+    print("[OK] deadline 可行性分析：infeasible gap=1，且查询不改变批次状态")
+
+    # --- 4e. estimated_seconds 必须为正整数 ---
+    assert client.post("/api/releases", json={
+        "version": "bad-dur", "nodes": [{"name": "a", "estimated_seconds": 0}]}).status_code == 422
+    assert client.post("/api/releases", json={
+        "version": "bad-dur", "nodes": [{"name": "a", "estimated_seconds": -5}]}).status_code == 422
+    r = client.post("/api/releases", json={
+        "version": "ok-dur", "nodes": [{"name": "a", "estimated_seconds": 7}]})
+    assert r.status_code == 201 and r.json()["nodes"][0]["estimated_seconds"] == 7
+    rid_dur = r.json()["id"]
+    print("[OK] estimated_seconds 正整数校验；不传按 0")
 
     # --- 5. 乱序回报：a 成功后直接回报 c（b 还没成功）---
     r = client.post(f"/api/releases/{rid}/report",
@@ -203,7 +294,7 @@ with TestClient(app) as client:
 
     # --- 13. 列表 & 404 ---
     items = client.get("/api/releases").json()["items"]
-    assert {i["id"] for i in items} == {rid, rid2, rid3}
+    assert {i["id"] for i in items} == {rid, rid2, rid3, cid, tid, rid_dur}
     assert client.get("/api/releases/nope").status_code == 404
     assert client.post("/api/releases/nope/report",
                        json={"node": "a", "status": "success", "version": "v"}).status_code == 404
@@ -215,10 +306,53 @@ from app import database  # noqa: E402
 database.init_db(os.environ["DB_PATH"])
 conn = database.get_conn()
 count = conn.execute("SELECT COUNT(*) AS c FROM releases").fetchone()["c"]
-assert count == 3, count
+assert count == 6, count
 with database.lock():
     v1 = conn.execute("SELECT status, version FROM releases WHERE version='v1'").fetchone()
 assert dict(v1) == {"status": "succeeded", "version": "v1"}
-print("[OK] SQLite 重新初始化幂等，历史数据保留（3 个批次）")
+print("[OK] SQLite 重新初始化幂等，历史数据保留（6 个批次）")
+
+# --- 15. 旧版 DB 文件（nodes 无 estimated_seconds 列）启动自动迁移，旧工期按 0 ---
+import sqlite3  # noqa: E402
+
+old_db = os.path.join(_tmp, "legacy.db")
+_legacy = sqlite3.connect(old_db)
+_legacy.executescript("""
+CREATE TABLE releases (id TEXT PRIMARY KEY, version TEXT NOT NULL, status TEXT NOT NULL,
+  levels_json TEXT NOT NULL DEFAULT '[]', error_code TEXT, error_message TEXT,
+  failed_node TEXT, failed_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE nodes (id INTEGER PRIMARY KEY AUTOINCREMENT, release_id TEXT NOT NULL,
+  name TEXT NOT NULL, node_type TEXT NOT NULL DEFAULT 'service', level INTEGER NOT NULL,
+  metadata_json TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT 'pending',
+  reported_version TEXT, error_code TEXT, error_message TEXT, reported_at TEXT,
+  updated_at TEXT NOT NULL, UNIQUE(release_id, name));
+CREATE TABLE edges (id INTEGER PRIMARY KEY AUTOINCREMENT, release_id TEXT NOT NULL,
+  from_node TEXT, to_node TEXT, UNIQUE(release_id, from_node, to_node));
+INSERT INTO releases VALUES ('leg1','ver','pending','[["x"],["y"]]',NULL,NULL,NULL,NULL,'t','t');
+INSERT INTO nodes (release_id,name,node_type,level,metadata_json,status,updated_at)
+  VALUES ('leg1','x','service',0,'{}','pending','t'),
+         ('leg1','y','service',1,'{}','pending','t');
+INSERT INTO edges (release_id,from_node,to_node) VALUES ('leg1','x','y');
+""")
+_legacy.commit()
+_legacy.close()
+
+from app import config  # noqa: E402
+
+config.DB_PATH = old_db
+database.init_db(old_db)
+cols = {row["name"] for row in database.get_conn().execute("PRAGMA table_info(nodes)")}
+assert "estimated_seconds" in cols, cols
+with TestClient(app) as legacy_client:
+    lp = legacy_client.get("/api/releases/leg1/plan").json()
+    assert lp["schedule"]["shortest_duration_seconds"] == 0
+    assert lp["schedule"]["critical_nodes"] == ["x", "y"]
+    assert lp["schedule"]["critical_path"] == ["x", "y"]
+    assert [n["estimated_seconds"] for n in lp["nodes"]] == [0, 0]
+    zero_deadline = legacy_client.get(
+        "/api/releases/leg1/plan?deadline_seconds=0"
+    ).json()["schedule"]
+    assert zero_deadline["feasible"] is True and zero_deadline["gap_seconds"] == 0
+print("[OK] 旧库自动迁移 estimated_seconds 列，旧批次工期按 0，CPM 分析完整")
 
 print("\n全部测试通过 ✔")
