@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     name         TEXT NOT NULL,
     node_type    TEXT NOT NULL DEFAULT 'service',
     level        INTEGER NOT NULL,
+    estimated_seconds INTEGER NOT NULL DEFAULT 0, -- 预计执行耗时（秒），缺省/旧批次为 0
     metadata_json TEXT NOT NULL DEFAULT '{}',
     status       TEXT NOT NULL DEFAULT 'pending', -- pending | success | failed | rolled_back
     reported_version TEXT,
@@ -73,6 +74,16 @@ CREATE INDEX IF NOT EXISTS idx_events_release ON node_events(release_id);
 """
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """对旧版本数据库文件做幂等列迁移（CREATE TABLE IF NOT EXISTS 不会改已有表）。"""
+    node_cols = {row["name"] for row in conn.execute("PRAGMA table_info(nodes)")}
+    if "estimated_seconds" not in node_cols:
+        # 旧批次没有工期列：补列，存量行按 DEFAULT 0 处理
+        conn.execute(
+            "ALTER TABLE nodes ADD COLUMN estimated_seconds INTEGER NOT NULL DEFAULT 0"
+        )
+
+
 def init_db(db_path: str | None = None) -> None:
     """创建数据目录、初始化表结构。进程启动时执行一次。"""
     global _conn
@@ -84,6 +95,7 @@ def init_db(db_path: str | None = None) -> None:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(_SCHEMA)
+    _migrate(conn)
     conn.commit()
     _conn = conn
 

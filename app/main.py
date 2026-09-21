@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
 from . import config, service
@@ -60,9 +60,17 @@ def get_release_status(release_id: str) -> dict:
 
 
 @app.get("/api/releases/{release_id}/plan", tags=["releases"])
-def get_release_plan(release_id: str) -> dict:
-    """查询拓扑分层执行计划。"""
-    return service.get_release_plan(release_id)
+def get_release_plan(
+    release_id: str,
+    deadline_seconds: int | None = Query(default=None, ge=0),
+) -> dict:
+    """查询拓扑分层执行计划 + 关键路径分析（CPM 前向/后向动态规划）。
+
+    可选 `deadline_seconds`：小于最短总工期时仍返回完整分析，
+    并标记 `schedule.feasible=false` 与缺口秒数 `schedule.deficit_seconds`。
+    该接口为只读，不改变批次状态。
+    """
+    return service.get_release_plan(release_id, deadline_seconds=deadline_seconds)
 
 
 @app.post("/api/releases/{release_id}/report", tags=["releases"])

@@ -3,6 +3,8 @@
 本地可运行的服务节点依赖图发布系统：客户端提交服务节点及依赖关系，创建带版本号的发布批次；
 系统按**拓扑层级**生成执行计划，接收每个节点的成功/失败回报；节点失败时**仅回滚本批次已成功的节点**
 并返回**可重试的断点**；同时拒绝**循环依赖**和**跨版本 / 乱序回报**。
+节点可携带预计工期（`estimated_seconds`），计划接口基于依赖 DAG 做**前向 / 后向动态规划（CPM）**，
+给出最短总工期、各节点最早 / 最晚开始时间、零余量关键节点与关键路径，并支持 `deadline_seconds` 可行性检查。
 
 ## 一条命令启动
 
@@ -54,6 +56,20 @@ DB_PATH=./data/releases.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 - 同一 level 内节点互不依赖，可并行回报；跨 level 必须按顺序。
 - 存在环时创建批次返回 `422 cycle_detected`，并给出环上节点。
 
+**工期估计与关键路径分析（CPM）**
+
+- 创建批次时每个节点可填 `estimated_seconds`（填写时必须为**正整数**，缺省按 0；
+  旧版本创建的批次没有工期数据，一律按 0 处理，旧数据库文件启动时自动补列迁移）。
+- `GET /api/releases/{id}/plan` 在依赖 DAG 上做前向 / 后向动态规划，返回 `schedule`：
+  - 前向 DP：`earliest_start` = 所有前置（最早开始 + 工期）的最大值，无前置为 0；
+  - 后向 DP：相对最短总工期反推每个节点的 `latest_start`；
+  - `total_slack = latest_start - earliest_start`，`critical_nodes` 列出**全部零余量关键节点**；
+  - `total_duration_seconds` 为最短总工期（最长路径权重）；`critical_path` 给出一条最长路径，
+    **并列最长路径存在时返回节点名序列字典序最小的一条**。
+- 可选查询参数 `deadline_seconds`：小于最短总工期时仍返回完整分析，并给出
+  `schedule.feasible=false` 与缺口秒数 `schedule.deficit_seconds`（= 最短总工期 − deadline）；
+  否则 `feasible=true`、缺口为 0。该接口为**只读分析，不改变批次 / 节点状态**。
+
 **回报与并发控制**
 
 - 回报必须携带与批次一致的 `version`，否则返回 `409 version_mismatch`（拒绝跨版本回报）。
@@ -78,10 +94,10 @@ DB_PATH=./data/releases.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `POST` | `/api/releases` | 创建发布批次（提交节点 + 依赖，自动拓扑分层，拒绝环） |
+| `POST` | `/api/releases` | 创建发布批次（提交节点 + 依赖，节点可带 `estimated_seconds`，自动拓扑分层，拒绝环） |
 | `GET` | `/api/releases?limit=50` | 发布批次列表 |
 | `GET` | `/api/releases/{id}` | 查询发布状态（节点状态、进度、next_nodes） |
-| `GET` | `/api/releases/{id}/plan` | 查询拓扑分层执行计划 |
+| `GET` | `/api/releases/{id}/plan` | 查询拓扑分层执行计划 + 关键路径分析（可选 `?deadline_seconds=N` 可行性检查，只读） |
 | `POST` | `/api/releases/{id}/report` | 节点成功 / 失败回报（跨版本、乱序返回 409） |
 | `POST` | `/api/releases/{id}/retry` | 从断点续发 |
 | `GET` | `/health` | 健康检查 |
@@ -91,14 +107,14 @@ DB_PATH=./data/releases.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 ## 端到端示例
 
 ```bash
-# 1) 创建批次：a、b 是底层，c 依赖 a/b，d 依赖 c
+# 1) 创建批次：a、b 是底层，c 依赖 a/b，d 依赖 c；estimated_seconds 为可选工期（正整数）
 curl -s -X POST http://localhost:8000/api/releases \
   -H 'Content-Type: application/json' \
   -d '{
     "version": "2026.09.20-001",
     "nodes": [
-      {"name": "svc-a"}, {"name": "svc-b"},
-      {"name": "svc-c"}, {"name": "svc-d"}
+      {"name": "svc-a", "estimated_seconds": 3}, {"name": "svc-b", "estimated_seconds": 3},
+      {"name": "svc-c", "estimated_seconds": 2}, {"name": "svc-d", "estimated_seconds": 4}
     ],
     "dependencies": [
       {"from_node": "svc-a", "to_node": "svc-c"},
@@ -108,8 +124,13 @@ curl -s -X POST http://localhost:8000/api/releases \
   }'
 # -> 计划分层: level0=[svc-a,svc-b]  level1=[svc-c]  level2=[svc-d]
 
-# 2) 查看执行计划
+# 2) 查看执行计划与关键路径分析（可带 deadline_seconds 做可行性检查）
 curl -s http://localhost:8000/api/releases/<ID>/plan
+curl -s 'http://localhost:8000/api/releases/<ID>/plan?deadline_seconds=8'
+# -> schedule.total_duration_seconds=9（3+2+4，最长路径）
+#    critical_path=[svc-a,svc-c,svc-d]（与 svc-b 路径并列最长，取节点名字典序最小）
+#    critical_nodes=[svc-a,svc-b,svc-c,svc-d]（全部零余量节点）
+#    deadline 8 < 9 -> feasible=false, deficit_seconds=1（只读分析，批次状态不变）
 
 # 3) 回报 level0 成功（同层可并行/乱序回报）
 curl -s -X POST http://localhost:8000/api/releases/<ID>/report \

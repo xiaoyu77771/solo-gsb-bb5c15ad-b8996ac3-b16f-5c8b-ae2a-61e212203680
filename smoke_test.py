@@ -209,16 +209,153 @@ with TestClient(app) as client:
                        json={"node": "a", "status": "success", "version": "v"}).status_code == 404
     print("[OK] 列表接口 / 404")
 
+    # --- 13b. estimated_seconds 校验：填写时必须为正整数 ---
+    for bad in (0, -5):
+        r = client.post("/api/releases", json={
+            "version": f"bad-dur-{bad}",
+            "nodes": [{"name": "a", "estimated_seconds": bad}],
+        })
+        assert r.status_code == 422, r.text
+    print("[OK] estimated_seconds 为 0 / 负数 -> 422")
+
+    # --- 13c. 关键路径分析：前向/后向 DP、零余量关键节点、字典序最小关键路径 ---
+    r = client.post("/api/releases", json={
+        "version": "v4",
+        "nodes": [
+            {"name": "svc-a", "estimated_seconds": 3},
+            {"name": "svc-b", "estimated_seconds": 3},
+            {"name": "svc-c", "estimated_seconds": 2},
+            {"name": "svc-d", "estimated_seconds": 4},
+            {"name": "svc-e", "estimated_seconds": 1},
+        ],
+        "dependencies": [
+            {"from_node": "svc-a", "to_node": "svc-c"},
+            {"from_node": "svc-b", "to_node": "svc-c"},
+            {"from_node": "svc-c", "to_node": "svc-d"},
+            {"from_node": "svc-a", "to_node": "svc-e"},
+        ],
+    })
+    assert r.status_code == 201, r.text
+    rid4 = r.json()["id"]
+    dur4 = {n["name"]: n["estimated_seconds"] for n in r.json()["nodes"]}
+    assert dur4 == {"svc-a": 3, "svc-b": 3, "svc-c": 2, "svc-d": 4, "svc-e": 1}, dur4
+
+    plan4 = client.get(f"/api/releases/{rid4}/plan").json()
+    s4 = plan4["schedule"]
+    assert s4["total_duration_seconds"] == 9  # 3 + 2 + 4（最长路径）
+    # svc-a->svc-c->svc-d 与 svc-b->svc-c->svc-d 并列最长，取节点名序列字典序最小者
+    assert s4["critical_path"] == ["svc-a", "svc-c", "svc-d"], s4["critical_path"]
+    assert s4["critical_nodes"] == ["svc-a", "svc-b", "svc-c", "svc-d"]
+    assert s4["deadline_seconds"] is None and s4["feasible"] is True
+    assert s4["deficit_seconds"] == 0
+    sn = {n["name"]: n for n in s4["nodes"]}
+    es_ls_slack = {k: (v["earliest_start"], v["latest_start"], v["total_slack"])
+                   for k, v in sn.items()}
+    assert es_ls_slack == {
+        "svc-a": (0, 0, 0), "svc-b": (0, 0, 0), "svc-c": (3, 3, 0),
+        "svc-d": (5, 5, 0), "svc-e": (3, 8, 5),
+    }, es_ls_slack
+    assert sn["svc-d"]["is_critical"] is True and sn["svc-e"]["is_critical"] is False
+    print("[OK] 关键路径分析 total=9 path=", s4["critical_path"],
+          "关键节点=", s4["critical_nodes"])
+
+    # deadline 充足 / 恰好相等 -> feasible
+    s = client.get(f"/api/releases/{rid4}/plan",
+                   params={"deadline_seconds": 12}).json()["schedule"]
+    assert s["feasible"] is True and s["deficit_seconds"] == 0
+    assert s["deadline_seconds"] == 12
+    s = client.get(f"/api/releases/{rid4}/plan",
+                   params={"deadline_seconds": 9}).json()["schedule"]
+    assert s["feasible"] is True and s["deficit_seconds"] == 0
+
+    # deadline 不足 -> 仍返回完整分析，feasible=false + 缺口秒数；查询不改变批次状态
+    before = client.get(f"/api/releases/{rid4}").json()
+    s = client.get(f"/api/releases/{rid4}/plan",
+                   params={"deadline_seconds": 7}).json()["schedule"]
+    assert s["feasible"] is False and s["deficit_seconds"] == 2
+    assert s["total_duration_seconds"] == 9
+    assert s["critical_path"] == ["svc-a", "svc-c", "svc-d"]
+    assert len(s["nodes"]) == 5
+    after = client.get(f"/api/releases/{rid4}").json()
+    assert after["status"] == before["status"] == "pending"
+    assert after["updated_at"] == before["updated_at"]
+    print("[OK] deadline=7 -> feasible=false, deficit=2；plan 查询为只读")
+
+    # deadline_seconds 参数校验：负数 -> 422
+    assert client.get(f"/api/releases/{rid4}/plan",
+                      params={"deadline_seconds": -1}).status_code == 422
+    print("[OK] deadline_seconds 为负数 -> 422")
+
+    # --- 13d. 创建时未填工期 -> 按 0 处理（rid3 全部节点无工期） ---
+    s3 = client.get(f"/api/releases/{rid3}/plan",
+                    params={"deadline_seconds": 0}).json()["schedule"]
+    assert s3["total_duration_seconds"] == 0 and s3["feasible"] is True
+    assert all(n["estimated_seconds"] == 0 for n in s3["nodes"])
+    assert s3["critical_path"] == ["a", "c"]  # 全零工期下字典序最小的最长链
+    print("[OK] 未填工期批次按 0 处理: total=0, path=", s3["critical_path"])
+
 # --- 14. 进程重启场景：对同一 SQLite 文件重新 init_db，数据仍在且表结构幂等 ---
 from app import database  # noqa: E402
 
 database.init_db(os.environ["DB_PATH"])
 conn = database.get_conn()
 count = conn.execute("SELECT COUNT(*) AS c FROM releases").fetchone()["c"]
-assert count == 3, count
+assert count == 4, count
 with database.lock():
     v1 = conn.execute("SELECT status, version FROM releases WHERE version='v1'").fetchone()
 assert dict(v1) == {"status": "succeeded", "version": "v1"}
-print("[OK] SQLite 重新初始化幂等，历史数据保留（3 个批次）")
+print("[OK] SQLite 重新初始化幂等，历史数据保留（4 个批次）")
+
+# --- 15. 旧版数据库文件迁移：nodes 表无 estimated_seconds 列时自动补列，存量行按 0 ---
+import sqlite3  # noqa: E402
+
+_old_db = os.path.join(_tmp, "legacy.db")
+_legacy = sqlite3.connect(_old_db)
+_legacy.executescript("""
+CREATE TABLE releases (
+    id TEXT PRIMARY KEY, version TEXT NOT NULL, status TEXT NOT NULL,
+    levels_json TEXT NOT NULL DEFAULT '[]', error_code TEXT, error_message TEXT,
+    failed_node TEXT, failed_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE nodes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, release_id TEXT NOT NULL, name TEXT NOT NULL,
+    node_type TEXT NOT NULL DEFAULT 'service', level INTEGER NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT 'pending',
+    reported_version TEXT, error_code TEXT, error_message TEXT, reported_at TEXT,
+    updated_at TEXT NOT NULL, UNIQUE(release_id, name)
+);
+CREATE TABLE edges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, release_id TEXT NOT NULL,
+    from_node TEXT NOT NULL, to_node TEXT NOT NULL,
+    UNIQUE(release_id, from_node, to_node)
+);
+CREATE TABLE node_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, release_id TEXT NOT NULL, node_name TEXT NOT NULL,
+    event_type TEXT NOT NULL, version TEXT, detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+""")
+_legacy.execute(
+    "INSERT INTO releases (id, version, status, levels_json, created_at, updated_at)"
+    " VALUES ('legacy1', 'v0', 'succeeded', '[[\"old-a\"]]', 't', 't')"
+)
+_legacy.execute(
+    "INSERT INTO nodes (release_id, name, level, updated_at) VALUES ('legacy1', 'old-a', 0, 't')"
+)
+_legacy.commit()
+_legacy.close()
+
+database.init_db(_old_db)  # 触发幂等迁移
+cols = {row["name"] for row in database.get_conn().execute("PRAGMA table_info(nodes)")}
+assert "estimated_seconds" in cols
+
+from app import service  # noqa: E402
+
+legacy_plan = service.get_release_plan("legacy1")
+assert legacy_plan["schedule"]["total_duration_seconds"] == 0
+assert legacy_plan["schedule"]["nodes"][0]["estimated_seconds"] == 0
+assert legacy_plan["schedule"]["critical_path"] == ["old-a"]
+database.init_db(_old_db)  # 重复迁移幂等
+print("[OK] 旧库自动补 estimated_seconds 列，存量批次工期按 0 处理")
 
 print("\n全部测试通过 ✔")

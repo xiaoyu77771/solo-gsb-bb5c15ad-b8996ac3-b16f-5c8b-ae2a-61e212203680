@@ -76,6 +76,80 @@ def compute_levels(node_names: list[str], edges: list[tuple[str, str]]) -> list[
 
 
 # --------------------------------------------------------------------------- #
+# 工期调度（CPM：前向 / 后向动态规划）
+# --------------------------------------------------------------------------- #
+def compute_schedule(
+    node_names: list[str],
+    durations: dict[str, int],
+    edges: list[tuple[str, str]],
+) -> dict[str, Any]:
+    """基于依赖 DAG 的关键路径分析（纯函数，不触碰数据库 / 批次状态）。
+
+    - 前向 DP：earliest_start[v] = max(earliest_start[p] + dur[p])（无前置为 0）
+    - 后向 DP：latest_finish[v] = min(latest_start[s])（无后继取最短总工期），
+      latest_start[v] = latest_finish[v] - dur[v]
+    - total_slack = latest_start - earliest_start；零余量节点即关键节点
+    - critical_path：并列最长路径中取节点名序列字典序最小的一条
+      （从 ES=0 的关键节点出发，沿“紧密边”贪心选名字最小的后继；
+      零余量节点必然存在零余量紧密后继，故贪心不会提前中断）
+    """
+    preds: dict[str, list[str]] = defaultdict(list)
+    succs: dict[str, list[str]] = defaultdict(list)
+    for frm, to in dict.fromkeys(edges):  # 去重，保持顺序
+        preds[to].append(frm)
+        succs[frm].append(to)
+
+    dur = {n: max(0, int(durations.get(n) or 0)) for n in node_names}
+    # 拓扑序（层内按名字排序，保证结果确定）；数据已校验无环
+    topo = [n for layer in compute_levels(node_names, edges) for n in layer]
+
+    # 前向：最早开始 / 完成时间
+    es: dict[str, int] = {}
+    for n in topo:
+        es[n] = max((es[p] + dur[p] for p in preds[n]), default=0)
+    ef = {n: es[n] + dur[n] for n in topo}
+    total = max(ef.values(), default=0)  # 最短总工期 = 最长路径权重
+
+    # 后向：最晚完成 / 开始时间（相对最短总工期，与 deadline 无关）
+    lf: dict[str, int] = {}
+    for n in reversed(topo):
+        lf[n] = min((lf[s] - dur[s] for s in succs[n]), default=total)
+    ls = {n: lf[n] - dur[n] for n in topo}
+    slack = {n: ls[n] - es[n] for n in topo}
+
+    critical_nodes = sorted(n for n in topo if slack[n] == 0)
+
+    # 字典序最小的最长路径：每步在“可延续最长路径”的紧密后继中选名字最小者
+    critical_path: list[str] = []
+    if topo:
+        cur = min(n for n in topo if slack[n] == 0 and es[n] == 0)
+        critical_path.append(cur)
+        while True:
+            nxt = [s for s in succs[cur] if slack[s] == 0 and es[s] == ef[cur]]
+            if not nxt:
+                break  # 到达 EF == 最短总工期 的终点，路径权重即 total
+            cur = min(nxt)
+            critical_path.append(cur)
+
+    return {
+        "total_duration_seconds": total,
+        "critical_path": critical_path,
+        "critical_nodes": critical_nodes,
+        "nodes": [
+            {
+                "name": n,
+                "estimated_seconds": dur[n],
+                "earliest_start": es[n],
+                "latest_start": ls[n],
+                "total_slack": slack[n],
+                "is_critical": slack[n] == 0,
+            }
+            for n in topo
+        ],
+    }
+
+
+# --------------------------------------------------------------------------- #
 # 发布批次
 # --------------------------------------------------------------------------- #
 def create_release(payload: CreateReleaseRequest) -> dict[str, Any]:
@@ -100,13 +174,15 @@ def create_release(payload: CreateReleaseRequest) -> dict[str, Any]:
         for node in payload.nodes:
             conn.execute(
                 """INSERT INTO nodes
-                   (release_id, name, node_type, level, metadata_json, status, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                   (release_id, name, node_type, level, estimated_seconds,
+                    metadata_json, status, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     release_id,
                     node.name,
                     node.node_type,
                     level_of[node.name],
+                    node.estimated_seconds if node.estimated_seconds is not None else 0,
                     json.dumps(node.metadata, ensure_ascii=False),
                     PENDING,
                     now,
@@ -149,7 +225,8 @@ def _release_summary(r: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def get_release_plan(release_id: str) -> dict[str, Any]:
+def get_release_plan(release_id: str, deadline_seconds: int | None = None) -> dict[str, Any]:
+    """查询执行计划 + 关键路径分析。只读操作，不改变批次 / 节点任何状态。"""
     with lock():
         conn = get_conn()
         r = dict(_get_release_row(conn, release_id))
@@ -162,6 +239,20 @@ def get_release_plan(release_id: str) -> dict[str, Any]:
         )]
 
     levels = json.loads(r["levels_json"])
+    schedule = compute_schedule(
+        [n["name"] for n in nodes],
+        {n["name"]: n["estimated_seconds"] for n in nodes},  # 旧批次缺列迁移后为 0
+        [(e["from_node"], e["to_node"]) for e in edges],
+    )
+    total = schedule["total_duration_seconds"]
+    feasible = deadline_seconds is None or deadline_seconds >= total
+    schedule["deadline_seconds"] = deadline_seconds
+    schedule["feasible"] = feasible
+    # 缺口秒数：deadline 小于最短总工期时的差值，可行或未给 deadline 时为 0
+    schedule["deficit_seconds"] = (
+        0 if deadline_seconds is None else max(0, total - deadline_seconds)
+    )
+
     return {
         "release_id": r["id"],
         "version": r["version"],
@@ -173,10 +264,12 @@ def get_release_plan(release_id: str) -> dict[str, Any]:
         ],
         "nodes": [
             {"name": n["name"], "node_type": n["node_type"], "level": n["level"],
+             "estimated_seconds": n["estimated_seconds"],
              "metadata": json.loads(n["metadata_json"])}
             for n in nodes
         ],
         "dependencies": [{"from": e["from_node"], "to": e["to_node"]} for e in edges],
+        "schedule": schedule,
         "execution_rule": "按 level 从小到大执行；同一 level 内节点无依赖关系可并行回报；"
                           "节点所有前置为 success 后才允许回报",
         "created_at": r["created_at"],
@@ -203,6 +296,7 @@ def _build_view(conn, r) -> dict[str, Any]:
             "name": n["name"],
             "node_type": n["node_type"],
             "level": n["level"],
+            "estimated_seconds": n["estimated_seconds"],
             "status": n["status"],
             "reported_version": n["reported_version"],
             "error_code": n["error_code"],

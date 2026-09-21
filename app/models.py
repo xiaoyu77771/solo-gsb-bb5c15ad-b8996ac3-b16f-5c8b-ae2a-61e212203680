@@ -9,6 +9,9 @@ from pydantic import BaseModel, Field
 class NodeInput(BaseModel):
     name: str = Field(..., min_length=1, description="节点名，批次内唯一")
     node_type: str = Field("service", description="节点类型，如 service / config / job")
+    estimated_seconds: int | None = Field(
+        None, ge=1, description="预计执行耗时（秒），填写时必须为正整数；缺省按 0 处理"
+    )
     metadata: dict[str, Any] = Field(default_factory=dict, description="附加元数据")
 
 
